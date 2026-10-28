@@ -1,0 +1,2211 @@
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Copy,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Trash2,
+  PanelsTopLeft,
+  Loader2,
+  Tags,
+  Download,
+  Upload,
+  ChevronRight,
+  ChevronDown,
+  ChevronUp,
+  AlertTriangle,
+  CheckSquare,
+  Square,
+  Check,
+  CheckCircle2,
+  X,
+  Sparkles,
+  RotateCcw,
+} from "lucide-react";
+import {
+  createBoard,
+  deleteBoard,
+  duplicateBoard,
+  listBoards,
+  putBoard,
+  renameBoard,
+  type BoardRecord,
+  blankBoard,
+  genBoardId,
+  autoExtractPhaseAndWeek,
+  normalizePhaseString,
+  setWorkspaceBoardPayload,
+} from "@/lib/boards-db";
+import { renderPdfToImages } from "@/lib/pdf-importer";
+import { generateBoardThumbnail } from "@/lib/thumbnail-generator";
+import { embedSmartPngMetadata, extractSmartPngMetadata } from "@/lib/smart-png";
+import { stripFileExtension, buildDownloadFilename } from "@/lib/filename-utils";
+import { globalBatchManager, type BatchProgressState } from "@/lib/batch-converter";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { HomeSettings, applyTheme } from "@/components/home-settings";
+import { I18nContext, useI18nProvider, useI18n } from "@/lib/i18n";
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "My Whiteboards — Hbibo Board" },
+      {
+        name: "description",
+        content:
+          "Your whiteboard dashboard: create, open, rename, duplicate and delete infinite canvas boards.",
+      },
+      { property: "og:title", content: "My Whiteboards — Hbibo Board" },
+      {
+        property: "og:description",
+        content: "Create and manage all of your infinite whiteboards in one place.",
+      },
+    ],
+  }),
+  component: HomeRoot,
+});
+
+function HomeRoot() {
+  const i18n = useI18nProvider();
+  return (
+    <I18nContext.Provider value={i18n}>
+      <HomePage />
+    </I18nContext.Provider>
+  );
+}
+
+const ALL_PHASES_VALUE = "__all__";
+const NO_PHASE_VALUE = "__none__";
+const UNASSIGNED_WEEK_VALUE = "__unassigned__";
+
+function timeAgoKey(ts: number): { key: string; vars?: Record<string, string | number> } {
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return { key: "justNow" };
+  if (m < 60) return { key: "minutesAgo", vars: { n: m } };
+  const h = Math.floor(m / 60);
+  if (h < 24) return { key: "hoursAgo", vars: { n: h } };
+  const d = Math.floor(h / 24);
+  if (d < 7) return { key: "daysAgo", vars: { n: d } };
+  return { key: "" };
+}
+
+function useTimeAgo() {
+  const { t } = useI18n();
+  return useCallback(
+    (ts: number) => {
+      const { key, vars } = timeAgoKey(ts);
+      if (!key) return new Date(ts).toLocaleDateString();
+      return t(key, vars);
+    },
+    [t],
+  );
+}
+
+function naturalWeekSort(a: string, b: string) {
+  const na = parseFloat(a);
+  const nb = parseFloat(b);
+  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+  return a.localeCompare(b);
+}
+
+function naturalPhaseSort(a: string, b: string) {
+  if (a === NO_PHASE_VALUE) return -1;
+  if (b === NO_PHASE_VALUE) return 1;
+  const na = a.match(/\d+/);
+  const nb = b.match(/\d+/);
+  if (na && nb) {
+    const numA = parseInt(na[0], 10);
+    const numB = parseInt(nb[0], 10);
+    if (numA !== numB) return numA - numB;
+  }
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+
+/* iOS-Style Swipe to Delete Modal with darkened backdrop */
+function IosSwipeToDeleteModal({
+  board,
+  onConfirm,
+  onCancel,
+}: {
+  board: BoardRecord;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useI18n();
+  const [dragProgress, setDragProgress] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragStartRef = useRef(0);
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    setIsDragging(true);
+    dragStartRef.current = e.clientX;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDragging || !trackRef.current) return;
+    const rect = trackRef.current.getBoundingClientRect();
+    const maxDrag = rect.width - 56;
+    if (maxDrag <= 0) return;
+    const delta = Math.max(0, Math.min(maxDrag, e.clientX - dragStartRef.current));
+    const prog = delta / maxDrag;
+    setDragProgress(prog);
+    if (prog >= 0.9) {
+      setIsDragging(false);
+      onConfirm();
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (!isDragging) return;
+    setIsDragging(false);
+    if (dragProgress < 0.9) {
+      setDragProgress(0);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-md transition-opacity">
+      <div
+        className="w-full max-w-sm overflow-hidden rounded-3xl border border-white/10 bg-slate-900/95 p-6 text-white shadow-2xl animate-in fade-in zoom-in-95 duration-200"
+        role="dialog"
+        aria-modal="true"
+      >
+        <div className="flex flex-col items-center text-center">
+          <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-red-500/20 text-red-400">
+            <AlertTriangle className="h-7 w-7" />
+          </div>
+          <h3 className="text-lg font-semibold text-white">
+            {t("deleteConfirmTitle", { name: board.name })}
+          </h3>
+          <p className="mt-2 text-xs leading-relaxed text-slate-300">{t("deleteConfirmDesc")}</p>
+        </div>
+
+        {/* iPhone Style Slide to Delete Slider */}
+        <div className="mt-6">
+          <div
+            ref={trackRef}
+            className="relative flex h-14 w-full items-center overflow-hidden rounded-full border border-red-500/30 bg-slate-800/90 px-1 shadow-inner select-none"
+          >
+            <div
+              className="absolute inset-y-0 left-0 bg-red-600/80 transition-all"
+              style={{ width: `${Math.max(0, dragProgress * 100)}%` }}
+            />
+            <span
+              className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs font-semibold uppercase tracking-wider text-slate-300 transition-opacity"
+              style={{ opacity: 1 - dragProgress * 1.5 }}
+            >
+              Slide to delete ➔
+            </span>
+
+            {/* Slider Handle */}
+            <div
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+              onPointerCancel={handlePointerUp}
+              className="relative z-10 flex h-12 w-12 cursor-grab active:cursor-grabbing items-center justify-center rounded-full bg-red-500 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
+              style={{
+                transform: `translateX(${dragProgress * ((trackRef.current?.getBoundingClientRect().width || 280) - 56)}px)`,
+              }}
+            >
+              <Trash2 className="h-5 w-5" />
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 flex justify-center">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={onCancel}
+            className="rounded-full px-6 text-sm text-slate-400 hover:bg-slate-800 hover:text-white"
+          >
+            {t("cancel")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BoardThumbnail({ board }: { board: BoardRecord }) {
+  const { t } = useI18n();
+  const [thumbSrc, setThumbSrc] = useState<string | null>(board.thumb || null);
+  const elements = (board.elements || []) as any[];
+
+  useEffect(() => {
+    if (board.thumb) {
+      setThumbSrc(board.thumb);
+      return undefined;
+    }
+    if (elements.length > 0) {
+      let isMounted = true;
+      generateBoardThumbnail(board).then((dataUrl) => {
+        if (isMounted && dataUrl) {
+          setThumbSrc(dataUrl);
+          void putBoard({ ...board, thumb: dataUrl });
+        }
+      });
+      return () => {
+        isMounted = false;
+      };
+    }
+    return undefined;
+  }, [board, elements.length]);
+
+  if (thumbSrc) {
+    return (
+      <img
+        src={thumbSrc}
+        alt={`${board.name} preview`}
+        className="h-full w-full object-cover"
+        loading="lazy"
+      />
+    );
+  }
+
+  if (elements.length > 0) {
+    return (
+      <div className="relative flex h-full w-full items-center justify-center bg-slate-50 dark:bg-slate-900/50 p-4">
+        <div className="flex flex-col items-center gap-1.5 text-muted-foreground">
+          <PanelsTopLeft className="h-6 w-6 opacity-60" />
+          <span className="text-[11px] font-medium opacity-80">
+            {elements.length} item{elements.length === 1 ? "" : "s"}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+      {t("emptyBoard")}
+    </div>
+  );
+}
+
+function BoardCard({
+  b,
+  onOpen,
+  selected,
+  onToggleSelect,
+  anySelected,
+  renaming,
+  renameValue,
+  setRenameValue,
+  onCommitRename,
+  onCancelRename,
+  onStartRename,
+  onDuplicate,
+  onDownload,
+  onDelete,
+  onEditDetails,
+  renameRef,
+}: {
+  b: BoardRecord;
+  onOpen: (id: string) => void;
+  selected: boolean;
+  onToggleSelect: () => void;
+  anySelected: boolean;
+  renaming: boolean;
+  renameValue: string;
+  setRenameValue: (v: string) => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
+  onStartRename: () => void;
+  onDuplicate: () => void;
+  onDownload: () => void;
+  onDelete: () => void;
+  onEditDetails: () => void;
+  renameRef: React.RefObject<HTMLInputElement | null>;
+}) {
+  const { t } = useI18n();
+  const timeAgo = useTimeAgo();
+  return (
+    <li
+      className={`group relative overflow-hidden rounded-2xl border bg-card shadow-sm transition-all hover:shadow-md ${
+        selected
+          ? "border-primary ring-2 ring-primary/40 shadow-md"
+          : "border-border/80 hover:border-primary/40"
+      }`}
+    >
+      <div className="relative block w-full">
+        {/* Selection Checkbox */}
+        <div className="absolute top-2.5 left-2.5 z-20">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleSelect();
+            }}
+            aria-label={selected ? "Deselect board" : "Select board"}
+            className={`flex h-6 w-6 items-center justify-center rounded-md border transition-all ${
+              selected
+                ? "border-primary bg-primary text-primary-foreground shadow-sm"
+                : "border-black/20 bg-white/85 dark:bg-black/60 backdrop-blur opacity-0 group-hover:opacity-100 hover:bg-white text-transparent hover:border-black/40 shadow-xs"
+            } ${anySelected ? "!opacity-100" : ""}`}
+          >
+            <Check className={`h-3.5 w-3.5 ${selected ? "opacity-100 stroke-[3]" : "opacity-0"}`} />
+          </button>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => (anySelected ? onToggleSelect() : onOpen(b.id))}
+          className="block w-full text-left"
+          aria-label={`Open ${b.name}`}
+        >
+          <div
+            className="aspect-[16/10] w-full overflow-hidden border-b bg-muted"
+            style={b.bgColor ? { backgroundColor: b.bgColor } : undefined}
+          >
+            <BoardThumbnail board={b} />
+          </div>
+        </button>
+      </div>
+      <div className="flex items-center gap-2 px-3.5 py-3">
+        <div className="min-w-0 flex-1">
+          {renaming ? (
+            <Input
+              ref={renameRef}
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onBlur={onCommitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") onCommitRename();
+                if (e.key === "Escape") onCancelRename();
+              }}
+              className="h-8 text-sm"
+            />
+          ) : (
+            <>
+              <p className="truncate text-sm font-semibold text-foreground">{b.name}</p>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                <p className="text-[11px] text-muted-foreground">
+                  {t("editedAgo", { t: timeAgo(b.updatedAt) })}
+                </p>
+                {b.phase && (
+                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                    {b.phase}
+                  </span>
+                )}
+                {b.week && (
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                    {t("weekLabel", { w: b.week })}
+                  </span>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 rounded-lg">
+              <MoreHorizontal className="h-4 w-4" />
+              <span className="sr-only">{t("boardActions")}</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={onStartRename}>
+              <Pencil className="h-4 w-4" /> {t("rename")}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onEditDetails}>
+              <Tags className="h-4 w-4" /> {t("editDetails")}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onDuplicate}>
+              <Copy className="h-4 w-4" /> {t("duplicate")}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onDownload}>
+              <Download className="h-4 w-4" /> {t("download")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="text-destructive focus:text-destructive"
+              onSelect={onDelete}
+            >
+              <Trash2 className="h-4 w-4" /> {t("delete")}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </li>
+  );
+}
+
+function BoardGrid(props: {
+  boards: BoardRecord[];
+  cardProps: (b: BoardRecord) => React.ComponentProps<typeof BoardCard>;
+}) {
+  return (
+    <ul className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+      {props.boards.map((b) => (
+        <BoardCard key={b.id} {...props.cardProps(b)} />
+      ))}
+    </ul>
+  );
+}
+
+function layoutImageElements(items: { name: string; src: string; w: number; h: number }[]) {
+  const N = items.length;
+  if (N === 0) return [];
+  const cols = N === 1 ? 1 : N <= 4 ? 2 : N <= 9 ? 3 : 4;
+  const gap = 36;
+
+  const colWidths: number[] = new Array(cols).fill(0);
+  const rowsCount = Math.ceil(N / cols);
+  const rowHeights: number[] = new Array(rowsCount).fill(0);
+
+  for (let i = 0; i < N; i++) {
+    const c = i % cols;
+    const r = Math.floor(i / cols);
+    colWidths[c] = Math.max(colWidths[c] ?? 0, items[i]?.w ?? 0);
+    rowHeights[r] = Math.max(rowHeights[r] ?? 0, items[i]?.h ?? 0);
+  }
+
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0) + (cols - 1) * gap;
+  const totalHeight = rowHeights.reduce((a, b) => a + b, 0) + (rowsCount - 1) * gap;
+
+  const colXOffsets: number[] = [0];
+  for (let c = 1; c < cols; c++) {
+    colXOffsets[c] = (colXOffsets[c - 1] ?? 0) + (colWidths[c - 1] ?? 0) + gap;
+  }
+  const rowYOffsets: number[] = [0];
+  for (let r = 1; r < rowsCount; r++) {
+    rowYOffsets[r] = (rowYOffsets[r - 1] ?? 0) + (rowHeights[r - 1] ?? 0) + gap;
+  }
+
+  const startX = -Math.round(totalWidth / 2);
+  const startY = -Math.round(totalHeight / 2);
+
+  return items.map((item, idx) => {
+    const c = idx % cols;
+    const r = Math.floor(idx / cols);
+    const cellX = startX + (colXOffsets[c] ?? 0);
+    const cellY = startY + (rowYOffsets[r] ?? 0);
+    const cellW = colWidths[c] ?? 0;
+    const cellH = rowHeights[r] ?? 0;
+    const posX = Math.round(cellX + (cellW - item.w) / 2);
+    const posY = Math.round(cellY + (cellH - item.h) / 2);
+
+    return {
+      id: genBoardId(),
+      type: "image",
+      src: item.src,
+      x: posX,
+      y: posY,
+      w: item.w,
+      h: item.h,
+      rotation: 0,
+    };
+  });
+}
+
+function HomePage() {
+  const { t } = useI18n();
+  const navigate = useNavigate();
+  const [boards, setBoards] = useState<BoardRecord[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<BoardRecord | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [search, setSearch] = useState("");
+  const [phaseFilter, setPhaseFilter] = useState<string>(ALL_PHASES_VALUE);
+  const [editingDetails, setEditingDetails] = useState<BoardRecord | null>(null);
+  const [detailsPhase, setDetailsPhase] = useState("");
+  const [detailsWeek, setDetailsWeek] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchCategoryOpen, setBatchCategoryOpen] = useState(false);
+  const [batchCategoryPhase, setBatchCategoryPhase] = useState("");
+  const [batchCategoryWeek, setBatchCategoryWeek] = useState("");
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+  const [isBatchDownloading, setIsBatchDownloading] = useState(false);
+  const [uploadPrompt, setUploadPrompt] = useState<{
+    fileCount: number;
+    smartCount: number;
+    normalCount: number;
+    smartBoards: BoardRecord[];
+    normalBoards: BoardRecord[];
+    normalFiles: File[];
+    combinedBoard: BoardRecord;
+    separateBoards: BoardRecord[];
+    rawFiles: File[];
+  } | null>(null);
+  const [batchProgress, setBatchProgress] = useState<BatchProgressState | null>(() =>
+    globalBatchManager.getProgress(),
+  );
+  const [batchExpanded, setBatchExpanded] = useState(false);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const unsubProgress = globalBatchManager.subscribe((state) => {
+      setBatchProgress(state ? { ...state } : null);
+    });
+    const unsubCompleted = globalBatchManager.onItemCompleted((board) => {
+      setBoards((prev) => {
+        const list = prev || [];
+        const filtered = list.filter((b) => b.id !== board.id);
+        return [board, ...filtered];
+      });
+    });
+    return () => {
+      unsubProgress();
+      unsubCompleted();
+    };
+  }, []);
+
+  useEffect(() => {
+    document.body.classList.add("hbibo-scroll");
+    try {
+      const theme = localStorage.getItem("hbibo.theme");
+      applyTheme(theme === "dark" ? "dark" : "light");
+    } catch {
+      /* ignore */
+    }
+    return () => document.body.classList.remove("hbibo-scroll");
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      setBoards(await listBoards());
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load your boards.");
+      setBoards([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (renaming) renameRef.current?.focus();
+  }, [renaming]);
+
+  const openBoard = useCallback(
+    async (id: string, boardRecord?: BoardRecord) => {
+      setError(null);
+      const target = boardRecord || (boards ? boards.find((b) => b.id === id) : null);
+      if (target) {
+        const updated = { ...target, updatedAt: Date.now() };
+        setWorkspaceBoardPayload(updated);
+        try {
+          await putBoard(updated);
+        } catch (err) {
+          console.warn("Failed to update board timestamp", err);
+        }
+      }
+      navigate({ to: "/board/$boardId", params: { boardId: id } });
+    },
+    [boards, navigate],
+  );
+
+  const handleCreate = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const board = await createBoard();
+      await openBoard(board.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create a board.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDownload = useCallback(async (b: BoardRecord) => {
+    try {
+      const elements = (b.elements || []) as any[];
+      const pad = 60;
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+
+      if (elements.length > 0) {
+        for (const el of elements) {
+          if (el.points && Array.isArray(el.points) && el.points.length) {
+            for (const p of el.points) {
+              minX = Math.min(minX, p.x);
+              minY = Math.min(minY, p.y);
+              maxX = Math.max(maxX, p.x);
+              maxY = Math.max(maxY, p.y);
+            }
+          } else {
+            const x = el.x ?? 0;
+            const y = el.y ?? 0;
+            const w = el.w ?? 100;
+            const h = el.h ?? 60;
+            minX = Math.min(minX, x, x + w);
+            minY = Math.min(minY, y, y + h);
+            maxX = Math.max(maxX, x, x + w);
+            maxY = Math.max(maxY, y, y + h);
+          }
+        }
+      }
+
+      if (!isFinite(minX) || !isFinite(minY)) {
+        minX = 0;
+        minY = 0;
+        maxX = 1200;
+        maxY = 800;
+      }
+
+      const width = Math.max(600, Math.ceil(maxX - minX + pad * 2));
+      const height = Math.max(400, Math.ceil(maxY - minY + pad * 2));
+      const canvas = document.createElement("canvas");
+      const dpr = 2;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.scale(dpr, dpr);
+
+      // Draw background
+      ctx.fillStyle = b.bgColor || "#fafafa";
+      ctx.fillRect(0, 0, width, height);
+
+      // Pre-load images if any
+      const imagePromises: Promise<void>[] = [];
+      const loadedImages = new Map<string, HTMLImageElement>();
+      for (const el of elements) {
+        if (el.type === "image" && el.src) {
+          const p = new Promise<void>((res) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+              loadedImages.set(el.src, img);
+              res();
+            };
+            img.onerror = () => res();
+            img.src = el.src;
+          });
+          imagePromises.push(p);
+        }
+      }
+      await Promise.all(imagePromises);
+
+      ctx.translate(-minX + pad, -minY + pad);
+
+      for (const el of elements) {
+        ctx.save();
+        const bx = el.x ?? 0,
+          by = el.y ?? 0,
+          bw = el.w ?? 100,
+          bh = el.h ?? 60;
+        const cx = bx + bw / 2,
+          cy = by + bh / 2;
+        if (el.rotation) {
+          ctx.translate(cx, cy);
+          ctx.rotate((el.rotation * Math.PI) / 180);
+          ctx.translate(-cx, -cy);
+        }
+        ctx.strokeStyle = el.color || "#1E1E1E";
+        ctx.fillStyle = el.color || "#1E1E1E";
+        ctx.lineWidth = el.width || 2;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        if (
+          (el.type === "pen" || el.type === "highlighter" || el.type === "vanishing") &&
+          el.points
+        ) {
+          if (el.type === "highlighter") ctx.globalAlpha = 0.4;
+          ctx.beginPath();
+          el.points.forEach((pt: { x: number; y: number }, idx: number) => {
+            if (idx === 0) ctx.moveTo(pt.x, pt.y);
+            else ctx.lineTo(pt.x, pt.y);
+          });
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        } else if (el.type === "rect") {
+          ctx.strokeRect(bx, by, bw, bh);
+        } else if (el.type === "roundRect") {
+          const r = Math.min(12, Math.abs(bw) / 4, Math.abs(bh) / 4);
+          if (typeof ctx.roundRect === "function") {
+            ctx.beginPath();
+            ctx.roundRect(bx, by, bw, bh, r);
+            ctx.stroke();
+          } else {
+            ctx.strokeRect(bx, by, bw, bh);
+          }
+        } else if (el.type === "circle" || el.type === "ellipse") {
+          ctx.beginPath();
+          ctx.ellipse(
+            bx + bw / 2,
+            by + bh / 2,
+            Math.abs(bw / 2),
+            Math.abs(bh / 2),
+            0,
+            0,
+            Math.PI * 2,
+          );
+          ctx.stroke();
+        } else if (el.type === "triangle") {
+          ctx.beginPath();
+          ctx.moveTo(bx + bw / 2, by);
+          ctx.lineTo(bx, by + bh);
+          ctx.lineTo(bx + bw, by + bh);
+          ctx.closePath();
+          ctx.stroke();
+        } else if (el.type === "diamond") {
+          ctx.beginPath();
+          ctx.moveTo(bx + bw / 2, by);
+          ctx.lineTo(bx + bw, by + bh / 2);
+          ctx.lineTo(bx + bw / 2, by + bh);
+          ctx.lineTo(bx, by + bh / 2);
+          ctx.closePath();
+          ctx.stroke();
+        } else if (el.type === "star") {
+          const scx = bx + bw / 2,
+            scy = by + bh / 2;
+          const outerR = Math.min(Math.abs(bw), Math.abs(bh)) / 2;
+          const innerR = outerR * 0.45;
+          ctx.beginPath();
+          for (let i = 0; i < 10; i++) {
+            const r = i % 2 === 0 ? outerR : innerR;
+            const a = (Math.PI / 5) * i - Math.PI / 2;
+            ctx.lineTo(scx + Math.cos(a) * r, scy + Math.sin(a) * r);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        } else if (el.type === "hexagon") {
+          const hcx = bx + bw / 2,
+            hcy = by + bh / 2,
+            rx = bw / 2,
+            ry = bh / 2;
+          ctx.beginPath();
+          for (let i = 0; i < 6; i++) {
+            const a = (Math.PI / 3) * i - Math.PI / 6;
+            const px = hcx + Math.cos(a) * rx,
+              py = hcy + Math.sin(a) * ry;
+            if (i === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        } else if (el.type === "sticky") {
+          ctx.fillStyle = el.bg || "#fef08a";
+          ctx.fillRect(bx, by, bw, bh);
+          ctx.fillStyle = el.color || "#422006";
+          const sz = el.size || 16;
+          ctx.font = `${sz}px Segoe UI,Inter,sans-serif`;
+          ctx.textBaseline = "top";
+          const lines = String(el.isPlaceholder ? "" : el.text || "").split("\n");
+          lines.forEach((l, idx) => ctx.fillText(l, bx + 10, by + 10 + idx * sz * 1.3));
+        } else if (el.type === "text") {
+          ctx.fillStyle = el.color || "#111827";
+          const sz = el.size || 18;
+          ctx.font = `${el.bold ? "bold " : ""}${el.italic ? "italic " : ""}${sz}px ${el.font || "Segoe UI,Inter,sans-serif"}`;
+          ctx.textBaseline = "top";
+          const lines = String(el.isPlaceholder ? "" : el.text || "").split("\n");
+          lines.forEach((l, idx) => ctx.fillText(l, bx, by + idx * sz * 1.25));
+        } else if (el.type === "image" && el.src) {
+          const img = loadedImages.get(el.src);
+          if (img) ctx.drawImage(img, bx, by, bw, bh);
+        } else if (el.type === "emoji") {
+          ctx.font = `${bw || 32}px sans-serif`;
+          ctx.textBaseline = "top";
+          ctx.fillText(el.text || "⭐", bx, by);
+        } else if (
+          el.type === "line" ||
+          el.type === "arrow" ||
+          el.type === "dashed" ||
+          el.type === "doubleArrow"
+        ) {
+          if (el.type === "dashed") ctx.setLineDash([8, 6]);
+          ctx.beginPath();
+          ctx.moveTo(bx, by);
+          ctx.lineTo(bx + bw, by + bh);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        ctx.restore();
+      }
+
+      const filename = buildDownloadFilename(b.name, "png");
+
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+        try {
+          const smartBlob = await embedSmartPngMetadata(blob, b);
+          const url = URL.createObjectURL(smartBlob);
+          const downloadAnchor = document.createElement("a");
+          downloadAnchor.setAttribute("href", url);
+          downloadAnchor.setAttribute("download", filename);
+          document.body.appendChild(downloadAnchor);
+          downloadAnchor.click();
+          downloadAnchor.remove();
+          URL.revokeObjectURL(url);
+        } catch {
+          const url = URL.createObjectURL(blob);
+          const downloadAnchor = document.createElement("a");
+          downloadAnchor.setAttribute("href", url);
+          downloadAnchor.setAttribute("download", filename);
+          document.body.appendChild(downloadAnchor);
+          downloadAnchor.click();
+          downloadAnchor.remove();
+          URL.revokeObjectURL(url);
+        }
+      }, "image/png");
+    } catch {
+      setError("Could not export board to PNG.");
+    }
+  }, []);
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setError(null);
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+    const files = Array.from(fileList);
+
+    const isPdf = (f: File) => f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+    const isImageFile = (f: File) =>
+      f.type.startsWith("image/") || /\.(png|jpe?g|webp|svg|gif|bmp|avif)$/i.test(f.name);
+    const isJsonFile = (f: File) => f.type === "application/json" || /\.json$/i.test(f.name);
+
+    try {
+      const smartBoards: BoardRecord[] = [];
+      const normalBoards: BoardRecord[] = [];
+      const normalFiles: File[] = [];
+      const allImageItems: { name: string; src: string; w: number; h: number }[] = [];
+      const baseTime = Date.now();
+
+      for (let idx = 0; idx < files.length; idx++) {
+        const file = files[idx]!;
+        const cleanName = stripFileExtension(file.name) || file.name || `Whiteboard ${idx + 1}`;
+        const cat = autoExtractPhaseAndWeek(cleanName);
+        const boardTime = baseTime + idx * 10;
+        const bId = genBoardId();
+
+        if (isImageFile(file) && !isPdf(file)) {
+          try {
+            // Check if it's a Smart PNG with embedded canvas metadata
+            const smartData = await extractSmartPngMetadata(file);
+            if (smartData && Array.isArray(smartData.elements) && smartData.elements.length > 0) {
+              const title = smartData.name || cleanName;
+              const smartCat = autoExtractPhaseAndWeek(title);
+              const smartBoard: BoardRecord = {
+                ...blankBoard(title),
+                id: bId,
+                name: title,
+                phase: smartData["phase"] || smartCat.phase,
+                week: smartData["week"] || smartCat.week,
+                phase_category: smartData["phase_category"] ?? smartCat.phase_category,
+                week_category: smartData["week_category"] ?? smartCat.week_category,
+                createdAt: boardTime,
+                updatedAt: boardTime,
+                needsFitToScreen: true,
+                elements: smartData.elements,
+                bgColor: smartData.bgColor || "#ffffff",
+                theme: smartData.theme || "classlight",
+                gridStyle: smartData.gridStyle || "none",
+                gridSpacing: smartData.gridSpacing || 24,
+                camera: smartData.camera || { x: 0, y: 0, zoom: 1 },
+                toolbarPos: (smartData as any)["toolbarPos"] || "bottom",
+                stickyAutoEdit: (smartData as any)["stickyAutoEdit"] ?? true,
+                thumb: (smartData as any)["thumb"] ?? null,
+              };
+              smartBoards.push(smartBoard);
+              continue;
+            }
+
+            const dataUrl = await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result as string);
+              reader.onerror = () => reject(new Error("File read error"));
+              reader.readAsDataURL(file);
+            });
+
+            const imgDim = await new Promise<{ w: number; h: number }>((resolve) => {
+              const img = new Image();
+              img.onload = () => {
+                const vw =
+                  typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1200;
+                const vh =
+                  typeof window !== "undefined" && window.innerHeight ? window.innerHeight : 800;
+                const maxW = Math.max(300, vw - 160);
+                const maxH = Math.max(200, vh - 160);
+                const origW = img.naturalWidth || img.width || 800;
+                const origH = img.naturalHeight || img.height || 600;
+                let w = origW;
+                let h = origH;
+                if (origW > maxW || origH > maxH) {
+                  const scale = Math.min(maxW / origW, maxH / origH);
+                  w = Math.round(origW * scale);
+                  h = Math.round(origH * scale);
+                }
+                resolve({ w, h });
+              };
+              img.onerror = () => resolve({ w: 480, h: 360 });
+              img.src = dataUrl;
+            });
+
+            const imgItem = { name: cleanName, src: dataUrl, w: imgDim.w, h: imgDim.h };
+            allImageItems.push(imgItem);
+            normalFiles.push(file);
+
+            const normalBoard: BoardRecord = {
+              ...blankBoard(cleanName),
+              id: bId,
+              name: cleanName,
+              phase: cat.phase,
+              week: cat.week,
+              phase_category: cat.phase_category,
+              week_category: cat.week_category,
+              createdAt: boardTime,
+              updatedAt: boardTime,
+              needsFitToScreen: true,
+              elements: layoutImageElements([imgItem]),
+            };
+            normalBoards.push(normalBoard);
+          } catch (e) {
+            console.warn("Could not load image file:", file.name, e);
+          }
+        } else if (isPdf(file)) {
+          try {
+            const pages = await renderPdfToImages(file);
+            normalFiles.push(file);
+            pages.forEach((p) => allImageItems.push(p));
+
+            const normalBoard: BoardRecord = {
+              ...blankBoard(cleanName),
+              id: bId,
+              name: cleanName,
+              phase: cat.phase,
+              week: cat.week,
+              phase_category: cat.phase_category,
+              week_category: cat.week_category,
+              createdAt: boardTime,
+              updatedAt: boardTime,
+              needsFitToScreen: true,
+              elements: layoutImageElements(pages),
+            };
+            normalBoards.push(normalBoard);
+          } catch (e) {
+            console.warn("Could not render PDF:", file.name, e);
+          }
+        } else if (isJsonFile(file)) {
+          try {
+            const text = await file.text();
+            const raw = JSON.parse(text);
+            const items: BoardRecord[] = Array.isArray(raw) ? raw : [raw];
+            for (const item of items) {
+              const boardName = item.name || cleanName;
+              const jsonCat = autoExtractPhaseAndWeek(boardName);
+              let rawEls = Array.isArray(item.elements) ? item.elements : [];
+              if (
+                rawEls.length === 0 &&
+                Array.isArray((item as any).layers) &&
+                (item as any).layers.length > 0
+              ) {
+                const layerEls = (item as any).layers[0]?.elements;
+                if (Array.isArray(layerEls)) rawEls = layerEls;
+              }
+              const smartBoard: BoardRecord = {
+                ...blankBoard(boardName),
+                ...item,
+                id: genBoardId(),
+                name: boardName,
+                phase: item.phase || jsonCat.phase,
+                week: item.week || jsonCat.week,
+                phase_category: item.phase_category ?? jsonCat.phase_category,
+                week_category: item.week_category ?? jsonCat.week_category,
+                createdAt: item.createdAt || boardTime,
+                updatedAt: boardTime,
+                needsFitToScreen: true,
+                elements: rawEls,
+              };
+              smartBoards.push(smartBoard);
+            }
+          } catch (e) {
+            console.warn("Could not parse JSON:", file.name, e);
+          }
+        }
+      }
+
+      const separateBoards = [...smartBoards, ...normalBoards];
+      if (separateBoards.length === 0) {
+        setError("No valid images, PDFs, or whiteboard files could be extracted.");
+        return;
+      }
+
+      // 2. Build combined board (all files arranged in 1 whiteboard)
+      let combinedElements: any[] = [];
+      if (allImageItems.length > 0) {
+        combinedElements = layoutImageElements(allImageItems);
+      } else {
+        combinedElements = smartBoards.flatMap((e) => e.elements || []);
+      }
+
+      const firstTitle = separateBoards[0]?.name ?? "Untitled";
+      const combinedTitle =
+        separateBoards.length === 1
+          ? firstTitle
+          : separateBoards.length <= 3
+            ? separateBoards.map((e) => e.name).join(", ")
+            : `${firstTitle} & ${separateBoards.length - 1} more`;
+
+      const combinedCat = autoExtractPhaseAndWeek(combinedTitle);
+      const combinedBoard: BoardRecord = {
+        ...blankBoard(combinedTitle),
+        id: genBoardId(),
+        name: combinedTitle,
+        phase: combinedCat.phase,
+        week: combinedCat.week,
+        phase_category: combinedCat.phase_category,
+        week_category: combinedCat.week_category,
+        createdAt: baseTime + separateBoards.length * 10,
+        updatedAt: baseTime + separateBoards.length * 10,
+        needsFitToScreen: true,
+        elements: combinedElements,
+      };
+
+      // Generate thumbnails proactively
+      for (const sb of separateBoards) {
+        if (!sb.thumb && sb.elements && sb.elements.length > 0) {
+          try {
+            sb.thumb = await generateBoardThumbnail(sb);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      if (!combinedBoard.thumb && combinedBoard.elements && combinedBoard.elements.length > 0) {
+        try {
+          combinedBoard.thumb = await generateBoardThumbnail(combinedBoard);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      setUploadPrompt({
+        fileCount: files.length,
+        smartCount: smartBoards.length,
+        normalCount: normalFiles.length,
+        smartBoards,
+        normalBoards,
+        normalFiles,
+        combinedBoard,
+        separateBoards,
+        rawFiles: files,
+      });
+    } catch (err) {
+      console.error("Import failure:", err);
+      setError("Could not process the uploaded file(s).");
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleConvertAll = async () => {
+    if (!uploadPrompt) return;
+    const { smartBoards, normalFiles } = uploadPrompt;
+    setUploadPrompt(null);
+    setSearch("");
+    setPhaseFilter(ALL_PHASES_VALUE);
+
+    // 1. Immediately import all detected SmartPNGs/editable whiteboards into DB without conversion
+    if (smartBoards.length > 0) {
+      for (const sb of smartBoards) {
+        if (!sb.thumb && sb.elements && sb.elements.length > 0) {
+          try {
+            sb.thumb = await generateBoardThumbnail(sb);
+          } catch {
+            /* ignore */
+          }
+        }
+        await putBoard(sb);
+      }
+      // Reactively show smart boards on the dashboard immediately
+      setBoards((prev) => {
+        const existing = prev || [];
+        const ids = new Set(smartBoards.map((b) => b.id));
+        const filtered = existing.filter((b) => !ids.has(b.id));
+        return [...smartBoards, ...filtered];
+      });
+    }
+
+    // 2. If there are normal files needing conversion, start the conversion queue
+    if (normalFiles.length > 0) {
+      globalBatchManager.startBatch(normalFiles, {
+        concurrency: 3,
+        onItemCompleted: (board) => {
+          // First finished = first displayed! Reactively update boards list
+          setBoards((prev) => {
+            const list = prev || [];
+            const filtered = list.filter((b) => b.id !== board.id);
+            return [board, ...filtered];
+          });
+        },
+        onItemFailed: (errMsg, item) => {
+          console.warn(`Conversion failed for ${item.fileName}: ${errMsg}`);
+        },
+        onAllFinished: () => {
+          void refresh();
+        },
+      });
+    } else {
+      await refresh();
+    }
+  };
+
+  const handleRetryItem = (itemId: string) => {
+    globalBatchManager.retryItem(itemId);
+  };
+
+  const handleRetryAllFailed = () => {
+    globalBatchManager.retryAllFailed();
+  };
+
+  const handleFallbackToImage = async (itemId: string) => {
+    await globalBatchManager.fallbackToImage(itemId);
+    await refresh();
+  };
+
+  const handleSaveAllAsImage = async () => {
+    await globalBatchManager.fallbackAllFailedToImage();
+    await refresh();
+  };
+
+  const handleCancelBatch = () => {
+    globalBatchManager.cancel();
+  };
+
+  const handleDismissBatch = () => {
+    globalBatchManager.dismiss();
+  };
+
+  const handleOpenCombined = async () => {
+    if (!uploadPrompt) return;
+    const { combinedBoard } = uploadPrompt;
+    setUploadPrompt(null);
+    try {
+      if (!combinedBoard.thumb && combinedBoard.elements && combinedBoard.elements.length > 0) {
+        try {
+          combinedBoard.thumb = await generateBoardThumbnail(combinedBoard);
+        } catch {
+          /* ignore */
+        }
+      }
+      await putBoard(combinedBoard);
+      const updatedList = await listBoards();
+      setBoards(updatedList);
+      setSearch("");
+      setPhaseFilter(ALL_PHASES_VALUE);
+      openBoard(combinedBoard.id, combinedBoard);
+    } catch {
+      setError("Could not save the whiteboard.");
+    }
+  };
+
+  const handleBackToHomepage = async () => {
+    if (!uploadPrompt) return;
+    const { smartBoards, normalBoards } = uploadPrompt;
+    setUploadPrompt(null);
+    try {
+      // 1. SmartBoards are saved directly as editable whiteboards
+      for (const board of smartBoards) {
+        if (!board.thumb && board.elements && board.elements.length > 0) {
+          try {
+            board.thumb = await generateBoardThumbnail(board);
+          } catch {
+            /* ignore */
+          }
+        }
+        await putBoard(board);
+      }
+
+      // 2. NormalBoards are saved as standard image whiteboards without AI conversion
+      for (const board of normalBoards) {
+        if (!board.thumb && board.elements && board.elements.length > 0) {
+          try {
+            board.thumb = await generateBoardThumbnail(board);
+          } catch {
+            /* ignore */
+          }
+        }
+        await putBoard(board);
+      }
+
+      const updatedList = await listBoards();
+      setBoards(updatedList);
+      setSearch("");
+      setPhaseFilter(ALL_PHASES_VALUE);
+    } catch {
+      setError("Could not save the whiteboard(s).");
+    }
+  };
+
+  const commitRename = useCallback(
+    async (id: string) => {
+      setRenaming(null);
+      try {
+        await renameBoard(id, renameValue);
+        await refresh();
+      } catch {
+        setError("Could not rename that board.");
+      }
+    },
+    [renameValue, refresh],
+  );
+
+  const commitDetails = async () => {
+    if (!editingDetails) return;
+    const updated: BoardRecord = { ...editingDetails, updatedAt: Date.now() };
+    const phaseVal = detailsPhase.trim();
+    const weekVal = detailsWeek.trim();
+    if (phaseVal) updated.phase = phaseVal;
+    else delete updated.phase;
+    if (weekVal) updated.week = weekVal;
+    else delete updated.week;
+    setEditingDetails(null);
+    try {
+      await putBoard(updated);
+      await refresh();
+    } catch {
+      setError("Could not update that board's details.");
+    }
+  };
+
+  const distinctPhases = useMemo(() => {
+    const map = new Map<string, string>();
+    (boards ?? []).forEach((b) => {
+      if (b.phase && b.phase.trim()) {
+        const norm = normalizePhaseString(b.phase.trim()) || b.phase.trim();
+        const key = norm.toLowerCase();
+        if (!map.has(key)) {
+          map.set(key, norm);
+        }
+      }
+    });
+    return Array.from(map.values()).sort(naturalPhaseSort);
+  }, [boards]);
+
+  const searchedBoards = useMemo(() => {
+    const all = boards ?? [];
+    const sorted = [...all].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    const q = search.trim().toLowerCase();
+    if (!q) return sorted;
+    return sorted.filter((b) => {
+      const hay = [b.name, b.phase ?? "", b.week ? `week ${b.week}` : "", b.week ?? ""]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  }, [boards, search]);
+
+  const activePhaseBoards = useMemo(() => {
+    if (phaseFilter === ALL_PHASES_VALUE) return [];
+    const filterKey = phaseFilter.toLowerCase().trim();
+    return searchedBoards
+      .filter((b) => {
+        const p = (b.phase || "").toLowerCase().trim();
+        const normP = (normalizePhaseString(b.phase) || "").toLowerCase().trim();
+        return p === filterKey || normP === filterKey;
+      })
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }, [searchedBoards, phaseFilter]);
+
+  const weekGroups = useMemo(() => {
+    const groups = new Map<string, BoardRecord[]>();
+    activePhaseBoards.forEach((b) => {
+      const key = b.week?.trim() ? b.week.trim() : UNASSIGNED_WEEK_VALUE;
+      const arr = groups.get(key) ?? [];
+      arr.push(b);
+      groups.set(key, arr);
+    });
+    const keys = Array.from(groups.keys()).sort((a, b) => {
+      if (a === UNASSIGNED_WEEK_VALUE) return 1;
+      if (b === UNASSIGNED_WEEK_VALUE) return -1;
+      return naturalWeekSort(a, b);
+    });
+    return keys.map((k) => {
+      const arr = groups.get(k)!;
+      arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      return { week: k, boards: arr };
+    });
+  }, [activePhaseBoards]);
+
+  const cardProps = useCallback(
+    (b: BoardRecord): React.ComponentProps<typeof BoardCard> => ({
+      b,
+      onOpen: openBoard,
+      selected: selectedIds.has(b.id),
+      anySelected: selectedIds.size > 0,
+      onToggleSelect: () => {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(b.id)) next.delete(b.id);
+          else next.add(b.id);
+          return next;
+        });
+      },
+      renaming: renaming === b.id,
+      renameValue,
+      setRenameValue,
+      onCommitRename: () => void commitRename(b.id),
+      onCancelRename: () => setRenaming(null),
+      onStartRename: () => {
+        setRenameValue(b.name);
+        setRenaming(b.id);
+      },
+      onDuplicate: () => {
+        void duplicateBoard(b.id).then(refresh);
+      },
+      onDownload: () => handleDownload(b),
+      onDelete: () => setPendingDelete(b),
+      onEditDetails: () => {
+        setDetailsPhase(b.phase ?? "");
+        setDetailsWeek(b.week ?? "");
+        setEditingDetails(b);
+      },
+      renameRef,
+    }),
+    [renaming, renameValue, refresh, selectedIds, commitRename, openBoard, handleDownload],
+  );
+
+  const totalCount = boards?.length ?? 0;
+  const hasPhaseSelected = phaseFilter !== ALL_PHASES_VALUE;
+
+  const isGroupAllSelected = (groupBoards: BoardRecord[]) =>
+    groupBoards.length > 0 && groupBoards.every((b) => selectedIds.has(b.id));
+
+  const toggleGroupSelection = (groupBoards: BoardRecord[]) => {
+    if (isGroupAllSelected(groupBoards)) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        groupBoards.forEach((b) => next.delete(b.id));
+        return next;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        groupBoards.forEach((b) => next.add(b.id));
+        return next;
+      });
+    }
+  };
+
+  const isSearching = search.trim().length > 0;
+  const currentVisible = hasPhaseSelected ? activePhaseBoards : searchedBoards;
+  const isAllVisibleSelected =
+    currentVisible.length > 0 && currentVisible.every((b) => selectedIds.has(b.id));
+
+  const selectAllVisible = () => {
+    setSelectedIds(new Set(currentVisible.map((b) => b.id)));
+  };
+
+  const toggleSelectAllVisible = () => {
+    if (isAllVisibleSelected) {
+      clearSelection();
+    } else {
+      selectAllVisible();
+    }
+  };
+
+  const clearSelection = () => {
+    setSelectedIds(new Set());
+  };
+
+  const handleBatchDownload = async () => {
+    const selectedList = (boards || []).filter((b) => selectedIds.has(b.id));
+    if (selectedList.length === 0) return;
+    setIsBatchDownloading(true);
+    try {
+      for (let i = 0; i < selectedList.length; i++) {
+        const b = selectedList[i];
+        if (b) await handleDownload(b);
+        if (i < selectedList.length - 1) {
+          await new Promise((r) => setTimeout(r, 220));
+        }
+      }
+    } finally {
+      setIsBatchDownloading(false);
+    }
+  };
+
+  const commitBatchCategory = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    const p = batchCategoryPhase.trim();
+    const w = batchCategoryWeek.trim();
+    for (const id of ids) {
+      const b = boards?.find((x) => x.id === id);
+      if (!b) continue;
+      const updated: BoardRecord = { ...b, updatedAt: Date.now() };
+      if (p) updated.phase = p;
+      if (w) updated.week = w;
+      await putBoard(updated);
+    }
+    setBatchCategoryOpen(false);
+    setSelectedIds(new Set());
+    await refresh();
+  };
+
+  const commitBatchDelete = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      await deleteBoard(id);
+    }
+    setBatchDeleteOpen(false);
+    setSelectedIds(new Set());
+    await refresh();
+  };
+
+  return (
+    <main className="min-h-dvh bg-[#F1F3F5]" style={{ backgroundColor: "#F1F3F5" }}>
+      <header className="border-b bg-card/70 backdrop-blur sticky top-0 z-20">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-2 sm:py-2.5">
+          <div className="flex items-center gap-2.5 sm:gap-3">
+            <img
+              src="/app-logo.png"
+              alt="Yow Yow"
+              className="h-8 w-8 object-contain shrink-0"
+              style={{
+                width: "32px",
+                height: "32px",
+                objectFit: "contain",
+                background: "transparent",
+                borderRadius: "6px",
+                border: "none",
+                boxShadow: "none",
+                padding: 0,
+              }}
+              referrerPolicy="no-referrer"
+            />
+            <div>
+              <h1 className="text-base sm:text-lg font-semibold tracking-tight leading-tight">
+                {t("appTitle")}
+              </h1>
+              <p className="text-[11px] sm:text-xs text-muted-foreground leading-tight">
+                {boards
+                  ? totalCount === 1
+                    ? t("boardCountOne")
+                    : t("boardCountOther", { n: totalCount })
+                  : t("loading")}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-1 flex-wrap items-center justify-end gap-2">
+            <div className="relative w-full max-w-xs sm:w-48 md:w-56">
+              <Input
+                ref={searchInputRef}
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t("searchPlaceholder")}
+                className="h-8.5 w-full text-xs pr-7"
+              />
+              {search.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearch("");
+                    searchInputRef.current?.focus();
+                  }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full p-0.5 text-muted-foreground/70 hover:text-foreground hover:bg-muted transition-colors focus:outline-none focus:ring-1 focus:ring-ring"
+                  aria-label="Clear search"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+            <Select value={phaseFilter} onValueChange={setPhaseFilter}>
+              <SelectTrigger className="h-8.5 w-36 sm:w-40 text-xs">
+                <SelectValue placeholder={t("selectPhase")} />
+              </SelectTrigger>
+              <SelectContent className="max-h-[216px] overflow-y-auto">
+                <SelectItem value={ALL_PHASES_VALUE}>{t("allPhases")}</SelectItem>
+                {distinctPhases.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {/* Hidden File Input for Import (Boards, Images & PDFs) */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleImportFile}
+              accept=".json,image/*,.pdf,application/pdf"
+              multiple
+              className="hidden"
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => fileInputRef.current?.click()}
+              className="h-8.5 w-8.5 rounded-full shrink-0"
+              title="Upload whiteboard, picture, or PDF"
+              aria-label="Upload whiteboard, picture, or PDF"
+            >
+              <Upload className="h-3.5 w-3.5" />
+            </Button>
+
+            <HomeSettings className="h-8.5 w-8.5 rounded-full shrink-0" />
+            <Button
+              onClick={handleCreate}
+              disabled={busy}
+              className="h-8.5 rounded-full px-3.5 text-xs font-bold bg-[#f5be18] hover:bg-[#e2ad0c] text-black border border-black/15 shadow-sm transition-all active:scale-[0.98]"
+            >
+              <Plus className="mr-1.5 h-3.5 w-3.5 text-black stroke-[2.5]" /> {t("newWhiteboard")}
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-7xl px-6 py-8">
+        {error && (
+          <div className="mb-6 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+
+        {boards === null && (
+          <div className="flex items-center gap-2 py-20 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> {t("loadingBoards")}
+          </div>
+        )}
+
+        {boards !== null && boards.length === 0 && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-24 text-center">
+            <img
+              src="/app-logo.png"
+              alt="Yow Yow"
+              className="mb-4 h-14 w-14 object-contain shrink-0"
+              style={{
+                width: "56px",
+                height: "56px",
+                objectFit: "contain",
+                background: "transparent",
+                borderRadius: "6px",
+                border: "none",
+                boxShadow: "none",
+                padding: 0,
+              }}
+              referrerPolicy="no-referrer"
+            />
+            <h2 className="text-base font-semibold">{t("noBoardsTitle")}</h2>
+            <p className="mt-1 max-w-sm text-sm text-muted-foreground">{t("noBoardsDesc")}</p>
+            <Button
+              onClick={handleCreate}
+              disabled={busy}
+              className="mt-6 rounded-full px-5 py-2.5 text-sm font-bold bg-[#f5be18] hover:bg-[#e2ad0c] text-black border border-black/15 shadow-sm transition-all active:scale-[0.98]"
+            >
+              <Plus className="mr-1.5 h-4 w-4 text-black stroke-[2.5]" /> {t("newWhiteboard")}
+            </Button>
+          </div>
+        )}
+
+        {boards !== null && boards.length > 0 && (
+          <div className="space-y-6">
+            {hasPhaseSelected ? (
+              <div className="space-y-8">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-base font-bold tracking-tight text-foreground">
+                    {phaseFilter}
+                  </h2>
+                  <span className="text-xs text-muted-foreground">
+                    {activePhaseBoards.length} {activePhaseBoards.length === 1 ? "board" : "boards"}
+                  </span>
+                </div>
+                {weekGroups.length === 0 && (
+                  <p className="text-sm text-muted-foreground">{t("noBoardsTitle")}</p>
+                )}
+                {weekGroups.map(({ week, boards: wb }) => {
+                  const isWeekAllSelected = isGroupAllSelected(wb);
+                  return (
+                    <section key={week} className="space-y-3">
+                      <div className="flex items-center justify-between gap-3 pb-1 border-b border-border/60">
+                        <div className="flex items-center gap-2">
+                          <h3 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                            {week === UNASSIGNED_WEEK_VALUE
+                              ? t("unassignedWeek")
+                              : t("weekLabel", { w: week })}
+                          </h3>
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                            {wb.length}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => toggleGroupSelection(wb)}
+                          className="flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                        >
+                          {isWeekAllSelected ? (
+                            <>
+                              <CheckSquare className="h-3.5 w-3.5 text-primary" />
+                              <span>Deselect Week</span>
+                            </>
+                          ) : (
+                            <>
+                              <Square className="h-3.5 w-3.5" />
+                              <span>Select Week</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                      <BoardGrid boards={wb} cardProps={cardProps} />
+                    </section>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3 pb-2 border-b border-border/70">
+                  <div className="flex items-center gap-2.5">
+                    <h2 className="text-base font-bold tracking-tight text-foreground">
+                      {t("allWhiteboards")}
+                    </h2>
+                    <span className="rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-semibold text-primary">
+                      {searchedBoards.length} {searchedBoards.length === 1 ? "board" : "boards"}
+                    </span>
+                  </div>
+                  {searchedBoards.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => toggleGroupSelection(searchedBoards)}
+                      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                    >
+                      {isAllVisibleSelected ? (
+                        <>
+                          <CheckSquare className="h-3.5 w-3.5 text-primary" />
+                          <span>Deselect All</span>
+                        </>
+                      ) : (
+                        <>
+                          <Square className="h-3.5 w-3.5" />
+                          <span>Select All</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+                {searchedBoards.length > 0 ? (
+                  <BoardGrid boards={searchedBoards} cardProps={cardProps} />
+                ) : (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    {t("noBoardsTitle")}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* iOS-Style Swipe Delete Modal */}
+      {pendingDelete && (
+        <IosSwipeToDeleteModal
+          board={pendingDelete}
+          onConfirm={() => {
+            const id = pendingDelete.id;
+            setPendingDelete(null);
+            if (id) void deleteBoard(id).then(refresh);
+          }}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
+
+      <Dialog
+        open={editingDetails !== null}
+        onOpenChange={(open) => !open && setEditingDetails(null)}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t("editBoardDetails")}</DialogTitle>
+            <DialogDescription className="sr-only">{t("editBoardDetails")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="phase-input">{t("phaseLabel")}</Label>
+              <Input
+                id="phase-input"
+                value={detailsPhase}
+                onChange={(e) => setDetailsPhase(e.target.value)}
+                placeholder={t("phasePlaceholder")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="week-input">{t("weekFieldLabel")}</Label>
+              <Input
+                id="week-input"
+                value={detailsWeek}
+                onChange={(e) => setDetailsWeek(e.target.value)}
+                placeholder={t("weekPlaceholder")}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingDetails(null)}>
+              {t("cancel")}
+            </Button>
+            <Button onClick={() => void commitDetails()}>{t("save")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Batch Assign Category Dialog */}
+      <Dialog
+        open={batchCategoryOpen}
+        onOpenChange={(open) => !open && setBatchCategoryOpen(false)}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t("batchCategoryTitle", { n: selectedIds.size })}</DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              Update phase and week category for all {selectedIds.size} selected whiteboards.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="batch-phase-input">{t("phaseLabel")}</Label>
+              <Input
+                id="batch-phase-input"
+                value={batchCategoryPhase}
+                onChange={(e) => setBatchCategoryPhase(e.target.value)}
+                placeholder={t("phasePlaceholder")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="batch-week-input">{t("weekFieldLabel")}</Label>
+              <Input
+                id="batch-week-input"
+                value={batchCategoryWeek}
+                onChange={(e) => setBatchCategoryWeek(e.target.value)}
+                placeholder={t("weekPlaceholder")}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBatchCategoryOpen(false)}>
+              {t("cancel")}
+            </Button>
+            <Button onClick={() => void commitBatchCategory()}>{t("apply")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Batch Delete Confirmation Dialog */}
+      <Dialog open={batchDeleteOpen} onOpenChange={(open) => !open && setBatchDeleteOpen(false)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-xl bg-destructive/10 text-destructive">
+              <AlertTriangle className="h-5 w-5" />
+            </div>
+            <DialogTitle className="text-base font-bold">
+              {t("batchDeleteTitle", { n: selectedIds.size })}
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              {t("batchDeleteDesc", { n: selectedIds.size })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setBatchDeleteOpen(false)}>
+              {t("cancel")}
+            </Button>
+            <Button variant="destructive" onClick={() => void commitBatchDelete()}>
+              {t("delete")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload Open Prompt Dialog */}
+      <Dialog open={!!uploadPrompt} onOpenChange={(open) => !open && handleBackToHomepage()}>
+        <DialogContent className="sm:max-w-lg p-6">
+          <DialogHeader>
+            <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <Upload className="h-5 w-5" />
+            </div>
+            <DialogTitle className="text-base font-bold">
+              {uploadPrompt?.smartCount &&
+              uploadPrompt?.smartCount > 0 &&
+              (!uploadPrompt?.normalCount || uploadPrompt?.normalCount === 0)
+                ? uploadPrompt.smartCount === 1
+                  ? "Editable Whiteboard Detected"
+                  : `${uploadPrompt.smartCount} Editable Whiteboards Detected`
+                : uploadPrompt?.fileCount === 1
+                  ? "File Uploaded Successfully"
+                  : `${uploadPrompt?.fileCount || 0} Files Uploaded Successfully`}
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              {uploadPrompt?.smartCount &&
+              uploadPrompt?.smartCount > 0 &&
+              uploadPrompt?.normalCount &&
+              uploadPrompt?.normalCount > 0
+                ? `${uploadPrompt.smartCount} editable whiteboard${uploadPrompt.smartCount > 1 ? "s" : ""} detected · ${uploadPrompt.normalCount} image${uploadPrompt.normalCount > 1 ? "s" : ""}/file${uploadPrompt.normalCount > 1 ? "s" : ""} require conversion`
+                : uploadPrompt?.smartCount && uploadPrompt?.smartCount > 0
+                  ? uploadPrompt.smartCount === 1
+                    ? `"${uploadPrompt.separateBoards[0]?.name}" contains native editable whiteboard elements and will be imported directly.`
+                    : `All ${uploadPrompt.smartCount} files contain native editable whiteboard elements and will be imported directly.`
+                  : uploadPrompt?.fileCount === 1
+                    ? `"${uploadPrompt.separateBoards[0]?.name}" is ready. Convert it into editable whiteboard elements, open it immediately, or save it to your homepage.`
+                    : `Choose "Convert all" to reconstruct each file into a separate editable whiteboard, "Open all in 1 board" to combine them, or "Back to homepage" to save image boards.`}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="mt-4 pt-3 border-t border-border/50">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 w-full">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleBackToHomepage()}
+                className="w-full rounded-xl text-xs font-medium h-9 px-2.5 truncate"
+                title="Back to homepage"
+              >
+                Back to homepage
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => void handleOpenCombined()}
+                className="w-full rounded-xl text-xs font-medium h-9 px-2.5 truncate"
+                title={uploadPrompt?.fileCount === 1 ? "Open now" : "Open all in 1 board"}
+              >
+                {uploadPrompt?.fileCount === 1 ? "Open now" : "Open all in 1 board"}
+              </Button>
+              <Button
+                type="button"
+                onClick={handleConvertAll}
+                className="w-full rounded-xl text-xs font-semibold gap-1.5 h-9 px-2.5 truncate shadow-sm bg-primary text-primary-foreground hover:bg-primary/90"
+                title={
+                  uploadPrompt?.normalCount &&
+                  uploadPrompt.normalCount > 0 &&
+                  uploadPrompt?.smartCount &&
+                  uploadPrompt.smartCount > 0
+                    ? `Convert ${uploadPrompt.normalCount} files to Whiteboard`
+                    : uploadPrompt?.normalCount && uploadPrompt.normalCount > 0
+                      ? uploadPrompt?.fileCount === 1
+                        ? "Convert to Whiteboard"
+                        : `Convert all (${uploadPrompt?.fileCount || 0})`
+                      : `Import to dashboard (${uploadPrompt?.smartCount || 0})`
+                }
+              >
+                <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  {uploadPrompt?.normalCount &&
+                  uploadPrompt.normalCount > 0 &&
+                  uploadPrompt?.smartCount &&
+                  uploadPrompt.smartCount > 0
+                    ? `Convert remaining (${uploadPrompt.normalCount})`
+                    : uploadPrompt?.normalCount && uploadPrompt.normalCount > 0
+                      ? uploadPrompt?.fileCount === 1
+                        ? "Convert to Whiteboard"
+                        : `Convert all (${uploadPrompt?.fileCount || 0})`
+                      : `Import to dashboard (${uploadPrompt?.smartCount || 0})`}
+                </span>
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Floating Batch Conversion Progress Card */}
+      {batchProgress && (
+        <aside
+          aria-label="Batch conversion progress"
+          className="fixed bottom-6 right-6 z-50 max-w-md w-[calc(100vw-3rem)] pointer-events-auto animate-in fade-in slide-in-from-bottom-5 duration-200"
+        >
+          <div className="rounded-2xl border border-border/80 bg-background/95 p-3.5 shadow-2xl backdrop-blur-md space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                {batchProgress.isFinished ? (
+                  batchProgress.failed > 0 ? (
+                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                      <AlertTriangle className="h-4 w-4" />
+                    </div>
+                  ) : (
+                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                      <CheckCircle2 className="h-4 w-4" />
+                    </div>
+                  )
+                ) : (
+                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  </div>
+                )}
+                <div className="min-w-0">
+                  <h4 className="text-xs font-bold text-foreground truncate">
+                    {batchProgress.isFinished
+                      ? batchProgress.failed > 0
+                        ? `Conversion Completed with Issues (${batchProgress.completed}/${batchProgress.total})`
+                        : `Conversion Complete (${batchProgress.completed} of ${batchProgress.total})`
+                      : `Converting Whiteboards (${batchProgress.completed + batchProgress.failed} / ${batchProgress.total})`}
+                  </h4>
+                  <p className="text-[11px] text-muted-foreground truncate">
+                    {batchProgress.isFinished
+                      ? batchProgress.failed > 0
+                        ? `${batchProgress.completed} converted, ${batchProgress.failed} failed. Save as image or retry.`
+                        : "All whiteboards ready and editable"
+                      : `${batchProgress.processing} in progress, ${batchProgress.pending} queued`}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1">
+                {batchProgress.failed > 0 && !batchProgress.processing && (
+                  <>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => void handleSaveAllAsImage()}
+                      className="h-7 px-2 rounded-lg text-[10px] font-semibold"
+                      title="Save all failed as image whiteboards without AI"
+                    >
+                      <span>Save all as image</span>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRetryAllFailed}
+                      className="h-7 px-2 rounded-lg text-[10px] font-semibold gap-1"
+                      title="Retry all failed conversions"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>Retry All</span>
+                    </Button>
+                  </>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setBatchExpanded((v) => !v)}
+                  className="h-7 w-7 rounded-lg text-muted-foreground hover:text-foreground"
+                  title={batchExpanded ? "Collapse" : "Expand"}
+                >
+                  {batchExpanded ? (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronUp className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+                {batchProgress.isFinished ? (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={handleDismissBatch}
+                    className="h-7 w-7 rounded-lg text-muted-foreground hover:text-foreground"
+                    title="Close"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleCancelBatch}
+                    className="h-7 px-2 rounded-lg text-[11px] font-medium text-destructive hover:bg-destructive/10"
+                  >
+                    Cancel
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            {/* Progress Bar */}
+            <div className="space-y-1">
+              <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-300 ${
+                    batchProgress.isFinished
+                      ? batchProgress.failed > 0
+                        ? "bg-amber-500"
+                        : "bg-emerald-500"
+                      : "bg-primary"
+                  }`}
+                  style={{ width: `${batchProgress.percent}%` }}
+                />
+              </div>
+            </div>
+
+            {/* Collapsible item list */}
+            {batchExpanded && (
+              <div className="max-h-52 overflow-y-auto space-y-2 pt-1 pr-1 text-[11px] border-t border-border/50">
+                {batchProgress.items.map((item) => (
+                  <div key={item.id} className="flex flex-col gap-1 rounded-lg bg-muted/40 p-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate max-w-[200px] font-medium text-foreground">
+                        {item.fileName}
+                      </span>
+                      <span className="shrink-0 flex items-center gap-1 text-[10px]">
+                        {item.status === "completed" && (
+                          <span className="text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1">
+                            <Check className="h-3 w-3" /> Done
+                          </span>
+                        )}
+                        {item.status === "processing" && (
+                          <span className="text-primary font-medium flex items-center gap-1">
+                            <Loader2 className="h-3 w-3 animate-spin" />{" "}
+                            {item.statusText || "Converting"}
+                          </span>
+                        )}
+                        {item.status === "pending" && (
+                          <span className="text-muted-foreground">Queued</span>
+                        )}
+                        {item.status === "failed" && (
+                          <span className="text-destructive font-medium">Failed</span>
+                        )}
+                      </span>
+                    </div>
+
+                    {item.status === "failed" && (
+                      <div className="flex items-center justify-between gap-2 pt-0.5 border-t border-border/40">
+                        <span
+                          className="text-[10px] text-destructive truncate max-w-[170px]"
+                          title={item.error}
+                        >
+                          {item.error || "Conversion failed"}
+                        </span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleRetryItem(item.id)}
+                            className="h-6 px-1.5 text-[10px] rounded-md gap-1"
+                          >
+                            <RotateCcw className="h-2.5 w-2.5" />
+                            Retry
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => void handleFallbackToImage(item.id)}
+                            className="h-6 px-1.5 text-[10px] rounded-md"
+                            title="Save as image whiteboard"
+                          >
+                            Save as image
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </aside>
+      )}
+
+      {/* Floating Multi-Selection Action Bar */}
+      {selectedIds.size > 0 && (
+        <aside
+          aria-label="Batch actions toolbar"
+          className="fixed bottom-6 inset-x-0 z-50 flex justify-center px-4 pointer-events-none animate-in fade-in slide-in-from-bottom-5 duration-200"
+        >
+          <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 rounded-2xl border border-border/80 bg-background/95 p-1.5 shadow-2xl backdrop-blur-md">
+            <div className="flex items-center gap-2 pl-3 pr-2 py-1">
+              <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">
+                {selectedIds.size}
+              </span>
+              <span className="text-xs font-semibold text-foreground">
+                {t("selectedCount", { n: selectedIds.size })}
+              </span>
+            </div>
+
+            <div className="h-4 w-px bg-border/80 mx-1" />
+
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={toggleSelectAllVisible}
+              className="h-8 rounded-xl px-2.5 text-xs font-medium"
+            >
+              {isAllVisibleSelected ? (
+                <>
+                  <Square className="mr-1.5 h-3.5 w-3.5" />
+                  Deselect All
+                </>
+              ) : (
+                <>
+                  <CheckSquare className="mr-1.5 h-3.5 w-3.5" />
+                  {t("selectAll")}
+                </>
+              )}
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setBatchCategoryPhase("");
+                setBatchCategoryWeek("");
+                setBatchCategoryOpen(true);
+              }}
+              className="h-8 rounded-xl px-2.5 text-xs font-medium"
+            >
+              <Tags className="mr-1.5 h-3.5 w-3.5" />
+              {t("assignCategory")}
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={isBatchDownloading}
+              onClick={() => void handleBatchDownload()}
+              className="h-8 rounded-xl px-2.5 text-xs font-medium"
+            >
+              {isBatchDownloading ? (
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="mr-1.5 h-3.5 w-3.5" />
+              )}
+              {t("batchDownload")}
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setBatchDeleteOpen(true)}
+              className="h-8 rounded-xl px-2.5 text-xs font-medium text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+              {t("batchDelete")}
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={clearSelection}
+              className="h-8 w-8 rounded-xl text-muted-foreground hover:text-foreground ml-1"
+              title={t("close")}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </aside>
+      )}
+    </main>
+  );
+}
